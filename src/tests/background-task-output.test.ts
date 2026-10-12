@@ -50,3 +50,57 @@ describe("session-owned background output", () => {
     await expect(runtime.readOutput("command", 0)).rejects.toThrow("output path");
   });
 });
+
+it("distinguishes stop receipts from terminal task notifications", async () => {
+  const updates: any[] = [];
+  const runtime = new AsyncTaskRuntime(
+    true,
+    "session",
+    async (event) => {
+      updates.push(event.update);
+    },
+    { terminalEvidence: true },
+  );
+  await runtime.taskStarted({
+    taskId: "command",
+    taskType: "local_bash",
+    isBackgrounded: true,
+    toolCallId: "tool",
+  });
+  await runtime.releaseHeld();
+  expect(runtime.claimStop("command")).toBe(true);
+  await runtime.taskStopped("command");
+  expect(
+    updates.find((update) => update.sessionUpdate === "async_task_state_update")?._meta?.cloudcode
+      ?.terminalEvidence,
+  ).toBe("stop_receipt");
+  await runtime.taskNotification("command", "completed");
+  expect(updates.at(-1)).toMatchObject({
+    state: "completed",
+    _meta: { cloudcode: { terminalEvidence: "event" } },
+  });
+});
+
+it("preserves UTF-8 characters across bounded output pages", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "claude-output-unicode-"));
+  try {
+    const path = join(directory, "command.output");
+    const text = "a".repeat(65535) + "中文😀tail";
+    await writeFile(path, text);
+    const runtime = new AsyncTaskRuntime(true, "session", async () => {});
+    await runtime.taskStarted({
+      taskId: "command",
+      taskType: "local_bash",
+      isBackgrounded: true,
+      toolCallId: "tool",
+      outputFilePath: path,
+    });
+    await runtime.releaseHeld();
+    const first = await runtime.readOutput("command", 0);
+    const second = await runtime.readOutput("command", first.nextOffset);
+    expect(first.text + second.text).toBe(text);
+    expect(second.nextOffset).toBe(Buffer.byteLength(text));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

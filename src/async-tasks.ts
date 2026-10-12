@@ -7,7 +7,7 @@ import { noticeOrTranscriptUpdate } from "./session-notices.js";
 type Publish = (notification: AcpSessionNotification) => Promise<void>;
 /** Moves an update to its owner session, or drops it with `null`. */
 type Route = (notification: AcpSessionNotification) => AcpSessionNotification | null;
-type TerminalSource = "event" | "level" | "shutdown";
+type TerminalSource = "event" | "level" | "shutdown" | "stop_receipt";
 
 type AsyncTask = {
   id: string;
@@ -135,6 +135,7 @@ export class AsyncTaskRuntime {
      *  `Monitor` tool call started is ignored. */
     private readonly options: {
       notices?: boolean;
+      terminalEvidence?: boolean;
       routeOf?: (toolCallId: string) => Route | undefined;
       toolNameOf?: (toolCallId: string) => string | undefined;
     } = {},
@@ -303,7 +304,8 @@ export class AsyncTaskRuntime {
 
     const task = this.task(taskId);
     const wasTerminal = isTerminal(task.state);
-    const correctsLevelState = wasTerminal && task.terminalSource === "level";
+    const correctsLevelState =
+      wasTerminal && (task.terminalSource === "level" || task.terminalSource === "stop_receipt");
     const previousOutputFilePath = task.outputFilePath;
     this.mergeOutputFilePath(task, message);
     this.mergeToolCallId(task, message);
@@ -415,7 +417,7 @@ export class AsyncTaskRuntime {
     task.stopAnnounced = true;
     // No terminal summary: a stopped task leaves the Async Tasks panel at once,
     // so anything said there is said to nobody.
-    await this.finish(task, "stopped", undefined, "event");
+    await this.finish(task, "stopped", undefined, "stop_receipt");
     // This acknowledgement is the only one the user gets -- the SDK injects
     // nothing into the model's context for a stopped shell task. A client on
     // the notice contract shows it as a live `notice`; otherwise the
@@ -497,7 +499,24 @@ export class AsyncTaskRuntime {
     try {
       const buffer = Buffer.alloc(65536);
       const { bytesRead } = await file.read(buffer, 0, buffer.length, offset);
-      return { text: buffer.subarray(0, bytesRead).toString(), nextOffset: offset + bytesRead };
+      // Byte cursors must not split a UTF-8 code point between independent reads.
+      // Leave an incomplete trailing sequence for the next read (also for a growing log).
+      let end = bytesRead;
+      let lead = end - 1;
+      while (lead >= 0 && (buffer[lead] & 0xc0) === 0x80) lead--;
+      if (lead >= 0) {
+        const byte = buffer[lead];
+        const width =
+          byte >= 0xf0 && byte <= 0xf4
+            ? 4
+            : byte >= 0xe0 && byte <= 0xef
+              ? 3
+              : byte >= 0xc2 && byte <= 0xdf
+                ? 2
+                : 1;
+        if (end - lead < width) end = lead;
+      }
+      return { text: buffer.subarray(0, end).toString(), nextOffset: offset + end };
     } finally {
       await file.close();
     }
@@ -683,7 +702,11 @@ export class AsyncTaskRuntime {
       // A level event can precede a late terminal edge (older CLIs sent the
       // level first). Correct its best-effort stopped state if that edge
       // later arrives.
-      if (task.terminalSource !== "level" || source !== "event") return;
+      if (
+        (task.terminalSource !== "level" && task.terminalSource !== "stop_receipt") ||
+        source !== "event"
+      )
+        return;
     }
     const previous = {
       state: task.state,
@@ -758,6 +781,11 @@ export class AsyncTaskRuntime {
       sessionUpdate: "async_task_state_update",
       asyncTaskId: task.id,
       state,
+      // A stop RPC receipt or missing level entry is not process-exit evidence.
+      // Preserve the native protocol state while allowing hosts to retain uncertainty.
+      ...(this.options.terminalEvidence
+        ? { _meta: { cloudcode: { terminalEvidence: task.terminalSource } } }
+        : {}),
       ...(summary ? { summary } : {}),
       ...changed,
     });

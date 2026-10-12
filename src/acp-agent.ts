@@ -4040,6 +4040,7 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       {
         notices: supportsNotices,
+        terminalEvidence: this.clientCapabilities?._meta?.cloudcode != null,
         // A task that a subagent tool call started belongs to the child
         // session of that tool call, like the tool call itself.
         routeOf: (toolCallId) =>
